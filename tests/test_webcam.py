@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from app import webcam
 from app.model import WordCertainty
@@ -56,9 +57,7 @@ def test_caption_window_is_user_resizable(monkeypatch) -> None:
     monkeypatch.setattr(
         webcam.cv2,
         "resizeWindow",
-        lambda title, width, height: calls.append(
-            ("resize", title, width, height)
-        ),
+        lambda title, width, height: calls.append(("resize", title, width, height)),
     )
     display = np.zeros((700, 960, 3), dtype=np.uint8)
 
@@ -199,3 +198,59 @@ def test_strong_visual_evidence_keeps_uncertain_real_speech() -> None:
     certainties = (WordCertainty("WORD", 0.3, 1),)
 
     assert _caption_has_enough_support(0.8, -1.5, certainties)
+
+
+@pytest.mark.parametrize(
+    "score,certainty",
+    [(-100.0, 0.9), (-0.1, 0.001), (float("nan"), 0.9), (-0.1, float("nan"))],
+)
+def test_strong_motion_does_not_bypass_invalid_or_extremely_weak_decoder_evidence(
+    score, certainty
+):
+    assert not _caption_has_enough_support(
+        0.8, score, (WordCertainty("WORD", certainty, 1),)
+    )
+
+
+def test_capture_downscales_landscape_and_portrait_and_converts_color():
+    for shape, expected in [
+        ((720, 1280, 3), (360, 640, 3)),
+        ((1280, 720, 3), (640, 360, 3)),
+    ]:
+        frame = np.zeros(shape, np.uint8)
+        frame[:, :, 0] = 255
+        rgb = webcam._capture_rgb(frame)
+        assert rgb.shape == expected
+        assert rgb[0, 0].tolist() == [0, 0, 255]
+
+
+def test_pending_queue_enforces_byte_budget_and_reports_drops():
+    frame = np.zeros((4, 4, 3), np.uint8)
+    queue = webcam.SegmentQueue(maximum_bytes=frame.nbytes * 2)
+    assert not queue.append(webcam.ReadySegment(1, (frame,), 0.8, 1.0, 0.0))
+    assert not queue.append(webcam.ReadySegment(2, (frame,), 0.8, 2.0, 1.0))
+    assert queue.append(webcam.ReadySegment(3, (frame,), 0.8, 3.0, 2.0)) == [1]
+    assert queue.dropped == 1
+    assert queue.nbytes <= queue.maximum_bytes
+    assert queue.popleft().entry_id == 2
+    assert queue.popleft().entry_id == 3
+    assert queue.nbytes == 0
+
+
+def test_queue_discards_oversized_item_without_evicting_valid_queued_work():
+    frame = np.zeros((4, 4, 3), np.uint8)
+    queue = webcam.SegmentQueue(maximum_bytes=frame.nbytes)
+    queue.append(webcam.ReadySegment(1, (frame,), 0.8, 1.0, 0.0))
+    assert queue.append(webcam.ReadySegment(2, (frame, frame), 0.8, 1.0, 0.0)) == [2]
+    assert queue.popleft().entry_id == 1
+
+
+def test_queue_removes_expired_caption_work():
+    frame = np.zeros((4, 4, 3), np.uint8)
+    queue = webcam.SegmentQueue()
+    history = CaptionHistory(limit=1)
+    old = history.start()
+    queue.append(webcam.ReadySegment(old, (frame,), 0.8, 1.0, 0.0))
+    history.start()
+    queue.discard_expired(history)
+    assert not queue and queue.nbytes == 0 and queue.dropped == 1

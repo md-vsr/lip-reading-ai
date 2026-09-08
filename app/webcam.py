@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from contextlib import ExitStack
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -20,9 +22,79 @@ from app.config import DEFAULT_CHECKPOINT, TARGET_FPS
 from app.model import WordCertainty
 from app.native_logging import with_filtered_native_diagnostics
 from app.pipeline import PipelineResult, VisualSpeechPipeline
+from app.timing import FrameClock
 
 
 WINDOW_TITLE = "Visual-Only Assistive Captions"
+
+
+@dataclass(frozen=True)
+class ReadySegment:
+    entry_id: int
+    frames: tuple[np.ndarray, ...]
+    motion_fraction: float
+    ready_at: float
+    last_motion_at: float
+
+    @property
+    def nbytes(self) -> int:
+        return sum(frame.nbytes for frame in self.frames)
+
+
+class SegmentQueue:
+    """Bound pending RGB data independently of the caption display history."""
+
+    def __init__(self, maximum_bytes: int = 512 * 1024 * 1024):
+        if maximum_bytes <= 0:
+            raise ValueError("Queue budget must be positive.")
+        self.maximum_bytes = maximum_bytes
+        self.nbytes = 0
+        self.dropped = 0
+        self.items: deque[ReadySegment] = deque()
+
+    def __bool__(self):
+        return bool(self.items)
+
+    def popleft(self):
+        item = self.items.popleft()
+        self.nbytes -= item.nbytes
+        return item
+
+    def append(self, item: ReadySegment) -> list[int]:
+        dropped = []
+        if item.nbytes > self.maximum_bytes:
+            self.dropped += 1
+            return [item.entry_id]
+        while self.items and self.nbytes + item.nbytes > self.maximum_bytes:
+            dropped.append(self.popleft().entry_id)
+        self.items.append(item)
+        self.nbytes += item.nbytes
+        self.dropped += len(dropped)
+        return dropped
+
+    def discard_expired(self, history):
+        while self.items and not history.contains(self.items[0].entry_id):
+            self.popleft()
+            self.dropped += 1
+
+
+def _capture_rgb(frame: np.ndarray, maximum_width: int = 640) -> np.ndarray:
+    """Bound camera RGB storage before collecting a speech window."""
+    if (
+        frame.ndim != 3
+        or frame.shape[2] != 3
+        or min(frame.shape[:2]) <= 0
+        or maximum_width <= 0
+    ):
+        raise ValueError(
+            "Expected a non-empty three-channel frame and positive size limit."
+        )
+    longest = max(frame.shape[:2])
+    if longest > maximum_width:
+        height = max(1, round(frame.shape[0] * maximum_width / longest))
+        width = max(1, round(frame.shape[1] * maximum_width / longest))
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
 @dataclass
@@ -98,15 +170,31 @@ def _caption_has_enough_support(
     word_certainties: tuple[WordCertainty, ...],
 ) -> bool:
     """Reject language-prior text when visual and decoder evidence are both weak."""
+    if (
+        not math.isfinite(motion_fraction)
+        or not 0 <= motion_fraction <= 1
+        or decoding_score_per_token is None
+        or not math.isfinite(decoding_score_per_token)
+        or not word_certainties
+        or any(
+            not math.isfinite(item.certainty) or not 0 <= item.certainty <= 1
+            for item in word_certainties
+        )
+    ):
+        return False
+    average_certainty = sum(item.certainty for item in word_certainties) / len(
+        word_certainties
+    )
+    # These conservative rejection floors are heuristics, not calibrated
+    # correctness probabilities. Strong motion must not bypass all evidence.
+    if decoding_score_per_token < -3.0 or average_certainty < 0.15:
+        return False
     if motion_fraction >= 0.3:
         return True
     if motion_fraction < 0.15 or decoding_score_per_token is None:
         return False
     if not word_certainties or decoding_score_per_token < -1.0:
         return False
-    average_certainty = sum(item.certainty for item in word_certainties) / len(
-        word_certainties
-    )
     return average_certainty >= 0.55
 
 
@@ -118,8 +206,26 @@ def _draw_text(
     color: tuple[int, int, int],
     thickness: int = 2,
 ) -> None:
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (0, 0, 0),
+        thickness + 3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 def _certainty_color(certainty: float) -> tuple[int, int, int]:
@@ -240,7 +346,9 @@ def _create_resizable_window(initial_display: np.ndarray) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Short-window visual-only webcam captions")
+    parser = argparse.ArgumentParser(
+        description="Short-window visual-only webcam captions"
+    )
     parser.add_argument(
         "--camera",
         default="phone",
@@ -280,8 +388,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Width of the camera and separate caption panel",
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--device", choices=("auto", "mps", "cpu", "cuda"), default="auto")
+    parser.add_argument(
+        "--device", choices=("auto", "mps", "cpu", "cuda"), default="auto"
+    )
     parser.add_argument("--beam-size", type=int, default=5)
+    parser.add_argument("--ctc-weight", type=float, default=0.1)
+    parser.add_argument("--no-decoder-cache", action="store_true")
     return parser
 
 
@@ -302,14 +414,26 @@ def main(argv: list[str] | None = None) -> int:
                 label = "external camera"
             print(f"{device.index}: {device.name} ({label})")
         return 0
-    if args.window_seconds < 1.0 or args.window_seconds > 16.0:
+    if (
+        not math.isfinite(args.window_seconds)
+        or args.window_seconds < 1.0
+        or args.window_seconds > 16.0
+    ):
         raise ValueError("Window length must be between 1 and 16 seconds.")
-    if args.mouth_motion_threshold <= 0:
+    if (
+        not math.isfinite(args.mouth_motion_threshold)
+        or args.mouth_motion_threshold <= 0
+    ):
         raise ValueError("Mouth-motion threshold must be positive.")
-    if args.speech_pause_seconds < 0.2 or args.speech_pause_seconds > 2.0:
+    if (
+        not math.isfinite(args.speech_pause_seconds)
+        or args.speech_pause_seconds < 0.2
+        or args.speech_pause_seconds > 2.0
+    ):
         raise ValueError("Speech pause must be between 0.2 and 2 seconds.")
     if (
-        args.minimum_speech_pause_seconds < 0.2
+        not math.isfinite(args.minimum_speech_pause_seconds)
+        or args.minimum_speech_pause_seconds < 0.2
         or args.minimum_speech_pause_seconds > args.speech_pause_seconds
     ):
         raise ValueError(
@@ -322,32 +446,58 @@ def main(argv: list[str] | None = None) -> int:
     device = resolve_camera(args.camera)
     print(f"Selected camera {device.index}: {device.name}")
     print("Loading visual speech model...")
-    pipeline = VisualSpeechPipeline(args.checkpoint, args.device, args.beam_size)
-    camera, first_frame = open_camera(device, TARGET_FPS)
+    resources = ExitStack()
+    try:
+        pipeline = resources.enter_context(
+            VisualSpeechPipeline(
+                args.checkpoint,
+                args.device,
+                args.beam_size,
+                ctc_weight=args.ctc_weight,
+                decoder_cache=not args.no_decoder_cache,
+            )
+        )
+        camera, first_frame = open_camera(device, TARGET_FPS)
+        resources.callback(camera.release)
+        motion_detector = LipMotionDetector(
+            min_motion_score=args.mouth_motion_threshold
+        )
+        resources.callback(motion_detector.close)
+        resources.callback(cv2.destroyAllWindows)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="visual-speech")
+        # Drain the worker before closing its MediaPipe detector.
+        resources.callback(executor.shutdown, wait=True, cancel_futures=True)
+        initial_display, _, _ = _build_display_canvas(first_frame, args.display_width)
+        _create_resizable_window(initial_display)
+    except BaseException:
+        resources.close()
+        raise
 
-    motion_detector = LipMotionDetector(
-        min_motion_score=args.mouth_motion_threshold
-    )
-    speech_collector = SpeechWindowCollector(
-        fps=TARGET_FPS,
-        maximum_seconds=args.window_seconds,
-        ending_silence_seconds=args.speech_pause_seconds,
-        minimum_ending_silence_seconds=args.minimum_speech_pause_seconds,
-    )
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="visual-speech")
+    def new_collector():
+        return SpeechWindowCollector(
+            fps=TARGET_FPS,
+            maximum_seconds=args.window_seconds,
+            ending_silence_seconds=args.speech_pause_seconds,
+            minimum_ending_silence_seconds=args.minimum_speech_pause_seconds,
+        )
+
+    speech_collector = new_collector()
+    frame_clock = FrameClock(TARGET_FPS)
+    last_observed_frame = None
+    last_observation = None
+    last_motion_at = time.monotonic()
+    future_last_motion_at = 0.0
+    queue_delay = 0.0
     future: Future[PipelineResult] | None = None
     future_entry_id: int | None = None
     future_motion_fraction = 0.0
     active_entry_id: int | None = None
-    ready_segments: deque[tuple[int, tuple[np.ndarray, ...], float]] = deque()
+    ready_segments = SegmentQueue()
     caption_history = CaptionHistory(limit=3)
     status = "WAITING FOR LIP MOVEMENT"
     face_visible = False
     lips_moving = False
     latency: float | None = None
-
-    initial_display, _, _ = _build_display_canvas(first_frame, args.display_width)
-    _create_resizable_window(initial_display)
 
     try:
         while True:
@@ -358,47 +508,81 @@ def main(argv: list[str] | None = None) -> int:
                 ok, frame = camera.read()
                 if not ok:
                     raise RuntimeError(f"{device.name} stopped returning frames.")
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            motion = motion_detector.observe(rgb)
-            face_visible = motion.face_visible
-            lips_moving = motion.active
-            mouth_settled = (
-                motion.face_visible
-                and motion.motion_score <= motion.threshold * 0.35
-            )
-            collector_active = motion.active or (
-                speech_collector.capturing and motion.moving
-            )
-            window_update = speech_collector.update(
-                rgb,
-                collector_active,
-                mouth_settled,
-                mouth_moving=motion.moving,
-            )
-            if window_update.started:
+            # OpenCV does not expose a portable device capture timestamp. Use
+            # frame delivery time, not the requested/possibly ignored camera fps.
+            delivered_at = time.monotonic()
+            rgb = _capture_rgb(frame)
+            try:
+                samples = frame_clock.update(rgb, delivered_at)
+            except ValueError:
                 if active_entry_id is not None:
-                    raise RuntimeError("A new speech window started before the last one ended.")
-                active_entry_id = caption_history.start()
-            if window_update.completed_frames is not None:
-                if active_entry_id is None:
-                    raise RuntimeError("A speech window ended without a caption row.")
-                ready_segments.append(
-                    (
-                        active_entry_id,
-                        window_update.completed_frames,
-                        window_update.motion_fraction,
-                    )
+                    caption_history.discard(active_entry_id)
+                    active_entry_id = None
+                speech_collector = new_collector()
+                frame_clock = FrameClock(TARGET_FPS)
+                motion_detector.reset()
+                last_observed_frame = last_observation = None
+                samples = frame_clock.update(rgb, delivered_at)
+            for sample in samples:
+                if sample.frame is last_observed_frame:
+                    # A duplicated image carries no new measured motion.
+                    motion = replace(last_observation, moving=False)
+                else:
+                    motion = motion_detector.observe(sample.frame)
+                    last_observed_frame, last_observation = sample.frame, motion
+                face_visible = motion.face_visible
+                lips_moving = motion.active
+                if motion.moving:
+                    last_motion_at = sample.timestamp
+                mouth_settled = (
+                    motion.face_visible
+                    and motion.motion_score <= motion.threshold * 0.35
                 )
-                active_entry_id = None
-            elif window_update.discarded:
-                if active_entry_id is None:
-                    raise RuntimeError("A rejected speech window had no caption row.")
-                caption_history.discard(active_entry_id)
-                active_entry_id = None
+                collector_active = motion.active or (
+                    speech_collector.capturing and motion.moving
+                )
+                window_update = speech_collector.update(
+                    sample.frame,
+                    collector_active,
+                    mouth_settled,
+                    mouth_moving=motion.moving,
+                )
+                if window_update.started:
+                    if active_entry_id is not None:
+                        raise RuntimeError(
+                            "A new speech window started before the last one ended."
+                        )
+                    active_entry_id = caption_history.start()
+                if window_update.completed_frames is not None:
+                    if active_entry_id is None:
+                        raise RuntimeError(
+                            "A speech window ended without a caption row."
+                        )
+                    dropped = ready_segments.append(
+                        ReadySegment(
+                            active_entry_id,
+                            window_update.completed_frames,
+                            window_update.motion_fraction,
+                            time.monotonic(),
+                            last_motion_at,
+                        )
+                    )
+                    for entry_id in dropped:
+                        caption_history.discard(entry_id)
+                    active_entry_id = None
+                elif window_update.discarded:
+                    if active_entry_id is None:
+                        raise RuntimeError(
+                            "A rejected speech window had no caption row."
+                        )
+                    caption_history.discard(active_entry_id)
+                    active_entry_id = None
 
             if future is not None and future.done():
                 if future_entry_id is None:
-                    raise RuntimeError("A recognition task finished without a caption row.")
+                    raise RuntimeError(
+                        "A recognition task finished without a caption row."
+                    )
                 try:
                     result = future.result()
                     if _caption_has_enough_support(
@@ -413,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     else:
                         caption_history.discard(future_entry_id)
-                    latency = result.preprocessing_seconds + result.recognition.inference_seconds
+                    latency = time.monotonic() - future_last_motion_at
                 except Exception as exc:
                     caption_history.complete(
                         future_entry_id, f"Could not transcribe: {exc}"
@@ -422,13 +606,15 @@ def main(argv: list[str] | None = None) -> int:
                 future_entry_id = None
                 future_motion_fraction = 0.0
 
-            while ready_segments and not caption_history.contains(ready_segments[0][0]):
-                ready_segments.popleft()
+            ready_segments.discard_expired(caption_history)
             if future is None and ready_segments:
-                future_entry_id, segment, future_motion_fraction = (
-                    ready_segments.popleft()
-                )
-                future = executor.submit(pipeline.transcribe_frames, segment)
+                segment = ready_segments.popleft()
+                future_entry_id = segment.entry_id
+                future_motion_fraction = segment.motion_fraction
+                future_last_motion_at = segment.last_motion_at
+                queue_delay = time.monotonic() - segment.ready_at
+                future = executor.submit(pipeline.transcribe_frames, segment.frames)
+                del segment
 
             if speech_collector.capturing and future is not None:
                 status = "CAPTURING / PROCESSING"
@@ -439,12 +625,16 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 status = "WAITING FOR LIP MOVEMENT"
 
-            display, _, panel_top = _build_display_canvas(
-                frame, args.display_width
-            )
+            display, _, panel_top = _build_display_canvas(frame, args.display_width)
             height, width = display.shape[:2]
             face_color = (80, 220, 100) if face_visible else (80, 180, 255)
-            _draw_text(display, "ASSISTIVE CAPTIONING PROTOTYPE", (18, 30), 0.65, (255, 255, 255))
+            _draw_text(
+                display,
+                "ASSISTIVE CAPTIONING PROTOTYPE",
+                (18, 30),
+                0.65,
+                (255, 255, 255),
+            )
             _draw_text(display, status, (18, 62), 0.72, (80, 220, 255))
             _draw_text(
                 display,
@@ -460,7 +650,14 @@ def main(argv: list[str] | None = None) -> int:
                 (80, 220, 100) if lips_moving else face_color,
             )
             if latency is not None:
-                _draw_text(display, f"Last latency: {latency:.1f}s", (max(18, width - 270), 62), 0.5, (220, 220, 220), 1)
+                _draw_text(
+                    display,
+                    f"Last latency: {latency:.1f}s",
+                    (max(18, width - 270), 62),
+                    0.5,
+                    (220, 220, 220),
+                    1,
+                )
 
             row_area_top = panel_top + 8
             row_area_bottom = height - 34
@@ -470,9 +667,7 @@ def main(argv: list[str] | None = None) -> int:
                 row_top = row_area_top + row_index * row_height
                 baseline = row_top + row_height // 2 + 8
                 if entry is None:
-                    _draw_text(
-                        display, "—", (22, baseline), 0.55, (105, 105, 105), 1
-                    )
+                    _draw_text(display, "—", (22, baseline), 0.55, (105, 105, 105), 1)
                 else:
                     if entry.pending:
                         placeholder = _processing_placeholder(entry.started_at, now)
@@ -513,7 +708,14 @@ def main(argv: list[str] | None = None) -> int:
                         1,
                         cv2.LINE_AA,
                     )
-            _draw_text(display, "Q: quit", (22, height - 12), 0.42, (180, 180, 180), 1)
+            _draw_text(
+                display,
+                f"Q: quit | queue {queue_delay:.1f}s | dropped {ready_segments.dropped}",
+                (22, height - 12),
+                0.42,
+                (180, 180, 180),
+                1,
+            )
             _draw_text(
                 display,
                 "WORD CERTAINTY: decoder estimate, not calibrated",
@@ -527,10 +729,7 @@ def main(argv: list[str] | None = None) -> int:
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break
     finally:
-        camera.release()
-        motion_detector.close()
-        cv2.destroyAllWindows()
-        executor.shutdown(wait=True, cancel_futures=True)
+        resources.close()
     return 0
 
 

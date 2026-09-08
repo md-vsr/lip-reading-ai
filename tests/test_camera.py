@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from app.camera import CameraDevice, discover_macos_cameras, resolve_camera
+from app.camera import CameraDevice, resolve_camera
 
 
 CAMERA_JSON = """{
@@ -35,7 +35,9 @@ def test_builtin_selector_avoids_iphone(run: Mock, _system: Mock) -> None:
 
 @patch("app.camera.platform.system", return_value="Darwin")
 @patch("app.camera.subprocess.run")
-def test_numeric_selector_can_still_choose_explicit_device(run: Mock, _system: Mock) -> None:
+def test_numeric_selector_can_still_choose_explicit_device(
+    run: Mock, _system: Mock
+) -> None:
     run.return_value = Mock(stdout=CAMERA_JSON)
     selected = resolve_camera("1")
     assert selected.index == 1
@@ -59,6 +61,8 @@ def test_invalid_camera_selector() -> None:
 
 
 def test_builtin_camera_classification() -> None:
-    assert CameraDevice(0, "FaceTime HD Camera", "FaceTime HD Camera", "x").is_builtin_mac_camera
+    assert CameraDevice(
+        0, "FaceTime HD Camera", "FaceTime HD Camera", "x"
+    ).is_builtin_mac_camera
     assert not CameraDevice(1, "iPhone Camera", "iPhone14,3", "y").is_builtin_mac_camera
     assert CameraDevice(1, "iPhone Camera", "iPhone14,3", "y").is_phone_camera
