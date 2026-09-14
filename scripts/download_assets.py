@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.request
 from fractions import Fraction
+from itertools import chain
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -93,31 +94,52 @@ def _download(
 
 
 def _gif_to_mp4(gif_path: Path, mp4_path: Path) -> None:
-    if mp4_path.is_file():
+    if _video_has_frames(mp4_path):
         print(f"Already present: {mp4_path}")
         return
-    with av.open(str(gif_path)) as source:
-        frames = list(source.decode(video=0))
-        if not frames:
-            raise RuntimeError(f"Sample GIF has no frames: {gif_path}")
-        output = av.open(str(mp4_path), mode="w")
-        stream = output.add_stream("libx264", rate=25)
-        stream.width = frames[0].width
-        stream.height = frames[0].height
-        stream.pix_fmt = "yuv420p"
-        for index, frame in enumerate(frames):
-            # GIF timestamps use a different time base; create clean CFR frames so
-            # those timestamps cannot leak into the MP4 muxer.
-            output_frame = av.VideoFrame.from_ndarray(
-                frame.to_ndarray(format="rgb24"), format="rgb24"
-            )
-            output_frame.pts = index
-            output_frame.time_base = Fraction(1, 25)
-            for packet in stream.encode(output_frame):
-                output.mux(packet)
-        for packet in stream.encode():
-            output.mux(packet)
-        output.close()
+
+    mp4_path.parent.mkdir(parents=True, exist_ok=True)
+    partial = mp4_path.with_name(f"{mp4_path.stem}.part{mp4_path.suffix}")
+    partial.unlink(missing_ok=True)
+    try:
+        with av.open(str(gif_path)) as source:
+            decoded_frames = source.decode(video=0)
+            first_frame = next(decoded_frames, None)
+            if first_frame is None:
+                raise RuntimeError(f"Sample GIF has no frames: {gif_path}")
+            with av.open(str(partial), mode="w", format="mp4") as output:
+                stream = output.add_stream("libx264", rate=25)
+                stream.width = first_frame.width
+                stream.height = first_frame.height
+                stream.pix_fmt = "yuv420p"
+                for index, frame in enumerate(chain((first_frame,), decoded_frames)):
+                    # GIF timestamps use a different time base; create clean CFR frames
+                    # so those timestamps cannot leak into the MP4 muxer.
+                    output_frame = av.VideoFrame.from_ndarray(
+                        frame.to_ndarray(format="rgb24"), format="rgb24"
+                    )
+                    output_frame.pts = index
+                    output_frame.time_base = Fraction(1, 25)
+                    for packet in stream.encode(output_frame):
+                        output.mux(packet)
+                for packet in stream.encode():
+                    output.mux(packet)
+        if not _video_has_frames(partial):
+            raise RuntimeError(f"Converted sample has no readable frames: {partial}")
+        partial.replace(mp4_path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def _video_has_frames(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with av.open(str(path)) as source:
+            return next(source.decode(video=0), None) is not None
+    except (OSError, av.FFmpegError):
+        return False
 
 
 def main() -> int:

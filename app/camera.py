@@ -67,19 +67,25 @@ def next_camera_device(
     if not available:
         raise RuntimeError("No cameras are currently available.")
 
-    current_position = next(
-        (
-            position
-            for position, device in enumerate(available)
-            if (
-                current.unique_id
-                and device.unique_id
-                and device.unique_id == current.unique_id
-            )
-            or device.index == current.index
-        ),
-        None,
-    )
+    current_position = None
+    if current.unique_id:
+        current_position = next(
+            (
+                position
+                for position, device in enumerate(available)
+                if device.unique_id == current.unique_id
+            ),
+            None,
+        )
+    if current_position is None:
+        current_position = next(
+            (
+                position
+                for position, device in enumerate(available)
+                if device.index == current.index
+            ),
+            None,
+        )
     if current_position is None:
         return available[0]
     if len(available) == 1:

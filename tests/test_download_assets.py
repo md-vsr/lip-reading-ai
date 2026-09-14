@@ -4,7 +4,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from scripts.download_assets import _download
+from app.config import DEFAULT_SAMPLE
+from scripts.download_assets import _download, _gif_to_mp4, _video_has_frames
 
 
 def response(payload):
@@ -64,3 +65,13 @@ def test_connection_errors_retry_with_finite_limit(tmp_path, monkeypatch):
     _download("https://example.invalid/model", file, 4, retries=1)
     assert request.call_count == 2
     assert file.read_bytes() == b"GOOD"
+
+
+def test_gif_conversion_atomically_replaces_invalid_output(tmp_path):
+    output = tmp_path / "sample.mp4"
+    output.write_bytes(b"incomplete")
+
+    _gif_to_mp4(DEFAULT_SAMPLE, output)
+
+    assert _video_has_frames(output)
+    assert not (tmp_path / "sample.part.mp4").exists()

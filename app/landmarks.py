@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 
 
+TRACK_REACQUIRE_AFTER_MISSES = 5
+
+
 def _box(detection) -> np.ndarray:
     box = detection.location_data.relative_bounding_box
     return np.array([box.xmin, box.ymin, box.width, box.height], dtype=float)
@@ -62,12 +65,20 @@ class FaceLandmarksDetector:
     def detect(self, frames, detector):
         landmarks = []
         previous_box = None
+        tracking_misses = 0
         for frame in frames:
             result = detector.process(frame)
-            selected = select_face(result.detections or [], previous_box)
+            detections = result.detections or []
+            selected = select_face(detections, previous_box)
+            if selected is None:
+                tracking_misses += 1
+                if tracking_misses >= TRACK_REACQUIRE_AFTER_MISSES:
+                    previous_box = None
+                    selected = select_face(detections)
             if selected is None:
                 landmarks.append(None)
                 continue
+            tracking_misses = 0
             detection, previous_box = selected
             height, width = frame.shape[:2]
             keypoints = detection.location_data.relative_keypoints

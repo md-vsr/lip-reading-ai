@@ -42,3 +42,22 @@ def test_detector_uses_largest_face_four_keypoints():
     )
     result = detector.detect([np.zeros((100, 100, 3), np.uint8)], backend)
     np.testing.assert_array_equal(result[0], np.full((4, 2), 25))
+
+
+def test_detector_reacquires_a_face_after_bounded_tracking_misses():
+    detector = FaceLandmarksDetector.__new__(FaceLandmarksDetector)
+    original = detection(x=0.1, y=0.1, width=0.2, height=0.2, marker=0.25)
+    moved = detection(x=0.7, y=0.7, width=0.2, height=0.2, marker=0.75)
+    results = iter(
+        [NS(detections=[original])] + [NS(detections=[moved])] * 5
+    )
+    backend = NS(process=lambda _: next(results))
+
+    landmarks = detector.detect(
+        [np.zeros((100, 100, 3), np.uint8)] * 6,
+        backend,
+    )
+
+    np.testing.assert_array_equal(landmarks[0], np.full((4, 2), 25))
+    assert landmarks[1:5] == [None] * 4
+    np.testing.assert_array_equal(landmarks[5], np.full((4, 2), 75))

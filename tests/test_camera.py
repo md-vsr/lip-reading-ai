@@ -81,3 +81,14 @@ def test_next_camera_requires_another_available_device() -> None:
 
     with pytest.raises(RuntimeError, match="No other camera"):
         next_camera_device(built_in, [built_in])
+
+
+def test_next_camera_prefers_stable_identity_after_reindexing() -> None:
+    current = CameraDevice(2, "iPhone Camera", "iPhone", "phone")
+    external = CameraDevice(0, "External Camera", "USB", "external")
+    built_in = CameraDevice(2, "FaceTime HD Camera", "Mac", "mac")
+    reindexed_phone = CameraDevice(3, "iPhone Camera", "iPhone", "phone")
+
+    assert next_camera_device(
+        current, [external, built_in, reindexed_phone]
+    ) == external

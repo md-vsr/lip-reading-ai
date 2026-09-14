@@ -16,7 +16,8 @@
   budget is not a bound on total process memory: active capture, in-flight work,
   stacking copies, model weights and activations also require memory.
 - Correct largest-face area selection in a local adapter and prefer the overlapping
-  face track thereafter. A disjoint bystander is not substituted for a lost speaker.
+  face track thereafter. A disjoint bystander is not substituted immediately, while
+  tracking resets after five consecutive misses so a moved speaker can be reacquired.
   The pinned Auto-AVSR submodule has not been edited.
 - Reject face tracks below 50% detection or with more than 1 second of consecutive
   missing detections. Retry the short-range detector on a poor full-range track.
@@ -36,6 +37,8 @@
 - Check checkpoint size **and SHA-256** against `models/manifest.json`; reject
   same-size corruption, use bounded network timeouts/retries, and atomically
   publish only a verified download. Failed downloads preserve the old file.
+- Validate existing sample videos and convert the GIF through a temporary MP4, then
+  atomically publish it only after a frame can be decoded.
 - Close detector resources explicitly, including failed initialization and webcam
   teardown; drain the worker before closing the preprocessing detector.
 - Add encoder/decoder/certainty timing fields, preprocessing-inclusive compute
@@ -63,6 +66,9 @@ nonuniform timestamps, budgets checked before RGB conversion, quality gates,
 download corruption/retries, resource cleanup, and the actual webcam control loop
 with a fake camera/model. Spatial pooling is checked for odd dimensions,
 non-contiguous input and MPS when available.
+
+Checkpoint-independent tests also run in GitHub Actions for every pull request and
+push to `main`; checkpoint-dependent integration tests remain local and conditional.
 
 The supplied sample was preprocessed successfully after the changes, yielding
 178 x 1 x 88 x 88 and a 90.45% detection rate. No physical webcam session was used

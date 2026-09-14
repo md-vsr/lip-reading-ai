@@ -201,6 +201,10 @@ implementation scope, new options, test coverage, and remaining validation work.
 uv run --no-sync pytest
 ```
 
+GitHub Actions runs the checkpoint-independent tests on every pull request and push
+to `main`. The two real-checkpoint integration tests remain conditional on locally
+downloaded assets.
+
 The suite includes camera selection, speech activity, caption history, word certainty,
 frame processing, and a real integration smoke test. The integration test loads the
 downloaded checkpoint, preprocesses the no-audio MP4, executes inference, and requires
