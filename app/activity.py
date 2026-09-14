@@ -57,8 +57,10 @@ class LipMotionObservation:
 def normalized_lip_shape(landmarks: np.ndarray) -> np.ndarray:
     """Normalize lip points for face translation, scale, and in-plane rotation."""
     points = np.asarray(landmarks, dtype=np.float32)
-    if points.ndim != 2 or points.shape[1] != 2 or len(points) <= max(
-        LIP_LANDMARK_INDICES
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+        or len(points) <= max(LIP_LANDMARK_INDICES)
     ):
         raise ValueError("Expected at least 416 two-dimensional face landmarks.")
 
@@ -114,7 +116,7 @@ class MotionActivationGate:
         required_motion_frames: int = 2,
         warmup_frames: int = 12,
     ) -> None:
-        if minimum_score <= 0:
+        if not math.isfinite(minimum_score) or minimum_score <= 0:
             raise ValueError("The mouth-motion threshold must be positive.")
         if not 1 <= required_motion_frames <= vote_window:
             raise ValueError("Required motion frames must fit inside the vote window.")
@@ -128,9 +130,9 @@ class MotionActivationGate:
         self._noise_floor = minimum_score / 5
 
     def update(self, score: float, face_visible: bool) -> MotionGateState:
-        threshold = adaptive_motion_threshold(
-            self.minimum_score, self._noise_floor
-        )
+        if not math.isfinite(score) or score < 0:
+            raise ValueError("Motion score must be finite and non-negative.")
+        threshold = adaptive_motion_threshold(self.minimum_score, self._noise_floor)
         if not face_visible:
             self._recent_motion.clear()
             self._face_frames = 0
@@ -139,9 +141,7 @@ class MotionActivationGate:
         self._face_frames += 1
         if 0 < score < self.minimum_score:
             self._noise_floor = 0.98 * self._noise_floor + 0.02 * score
-            threshold = adaptive_motion_threshold(
-                self.minimum_score, self._noise_floor
-            )
+            threshold = adaptive_motion_threshold(self.minimum_score, self._noise_floor)
         moving = self._face_frames > self.warmup_frames and score >= threshold
         self._recent_motion.append(moving)
         active = sum(self._recent_motion) >= self.required_motion_frames
@@ -215,6 +215,12 @@ class LipMotionDetector:
     def close(self) -> None:
         self._face_mesh.close()
 
+    def reset(self) -> None:
+        """Discard stale temporal evidence after a capture interruption."""
+        self._shape_history.clear()
+        self._activation_gate.update(0.0, False)
+        self._face_mesh.reset()
+
 
 @dataclass(frozen=True)
 class SpeechWindowUpdate:
@@ -239,6 +245,22 @@ class SpeechWindowCollector:
         minimum_motion_seconds: float = 0.2,
         minimum_motion_fraction: float = 0.15,
     ) -> None:
+        values = (
+            fps,
+            maximum_seconds,
+            preroll_seconds,
+            ending_silence_seconds,
+            minimum_seconds,
+            settled_silence_seconds,
+            minimum_motion_seconds,
+            minimum_motion_fraction,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Speech window settings must be finite.")
+        if preroll_seconds < 0 or minimum_seconds <= 0:
+            raise ValueError(
+                "Preroll must be non-negative and minimum duration positive."
+            )
         if fps <= 0 or maximum_seconds <= 0:
             raise ValueError("Frame rate and maximum window length must be positive.")
         if minimum_seconds > maximum_seconds:
@@ -247,7 +269,10 @@ class SpeechWindowCollector:
             raise ValueError("Silence durations must be positive.")
         if minimum_ending_silence_seconds is None:
             minimum_ending_silence_seconds = min(0.5, ending_silence_seconds)
-        if minimum_ending_silence_seconds <= 0:
+        if (
+            not math.isfinite(minimum_ending_silence_seconds)
+            or minimum_ending_silence_seconds <= 0
+        ):
             raise ValueError("Minimum ending silence must be positive.")
         if minimum_ending_silence_seconds > ending_silence_seconds:
             raise ValueError("Minimum ending silence cannot exceed the maximum.")
@@ -308,18 +333,15 @@ class SpeechWindowCollector:
             self._settled_frames = 0
         else:
             self._silent_frames += 1
-            self._settled_frames = (
-                self._settled_frames + 1 if mouth_settled else 0
-            )
+            self._settled_frames = self._settled_frames + 1 if mouth_settled else 0
         reached_maximum = len(self._frames) >= self.maximum_frames
         reached_confident_silence = (
             self._silent_frames >= self.minimum_ending_silence_frames
             and self._settled_frames >= self.settled_silence_frames
         )
         reached_silence_limit = self._silent_frames >= self.ending_silence_frames
-        reached_silence = (
-            len(self._frames) >= self.minimum_frames
-            and (reached_confident_silence or reached_silence_limit)
+        reached_silence = len(self._frames) >= self.minimum_frames and (
+            reached_confident_silence or reached_silence_limit
         )
         if not reached_maximum and not reached_silence:
             return SpeechWindowUpdate()

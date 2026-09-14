@@ -36,6 +36,9 @@ class RecognitionResult:
     word_certainties: tuple[WordCertainty, ...]
     average_process_cpu_percent: float
     memory_rss_mb: float
+    encoder_seconds: float = 0.0
+    decoder_seconds: float = 0.0
+    certainty_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -114,9 +117,9 @@ class MpsSpatialMaxPool(torch.nn.Module):
         if video.ndim != 5:
             raise ValueError("Expected video features shaped [B, C, T, H, W].")
         batch, channels, frames, height, width = video.shape
-        spatial_frames = video.permute(0, 2, 1, 3, 4).reshape(
-            batch * frames, channels, height, width
-        )
+        # The temporal kernel is one: every B/C/T plane is independent. Avoid
+        # permuting the full activation tensor before and after spatial pooling.
+        spatial_frames = video.reshape(batch * channels * frames, 1, height, width)
         pooled = F.max_pool2d(
             spatial_frames,
             kernel_size=(3, 3),
@@ -124,11 +127,7 @@ class MpsSpatialMaxPool(torch.nn.Module):
             padding=(1, 1),
         )
         pooled_height, pooled_width = pooled.shape[-2:]
-        return (
-            pooled.reshape(batch, frames, channels, pooled_height, pooled_width)
-            .permute(0, 2, 1, 3, 4)
-            .contiguous()
-        )
+        return pooled.reshape(batch, channels, frames, pooled_height, pooled_width)
 
 
 def _replace_mps_unsupported_pool(model: torch.nn.Module) -> None:
@@ -156,6 +155,10 @@ class AutoAVSRRecognizer:
         checkpoint: str | Path = DEFAULT_CHECKPOINT,
         device: str = "auto",
         beam_size: int = 10,
+        *,
+        ctc_weight: float = 0.1,
+        decoder_cache: bool = True,
+        word_certainty: bool = True,
     ) -> None:
         validate_model_source()
         checkpoint_path = Path(checkpoint).expanduser().resolve()
@@ -165,6 +168,8 @@ class AutoAVSRRecognizer:
             )
         if beam_size < 1:
             raise ValueError("Beam size must be at least 1.")
+        if not math.isfinite(ctc_weight) or not 0 <= ctc_weight <= 1:
+            raise ValueError("CTC weight must be between zero and one.")
 
         source = str(THIRD_PARTY_ROOT)
         if source not in sys.path:
@@ -176,32 +181,47 @@ class AutoAVSRRecognizer:
         # Keep decoding on CPU for MPS while accelerating the expensive visual
         # frontend and Conformer encoder on Metal.
         self.decoder_device = (
-            torch.device("cpu") if self.encoder_device.type == "mps" else self.encoder_device
+            torch.device("cpu")
+            if self.encoder_device.type == "mps"
+            else self.encoder_device
         )
         self.beam_size = beam_size
         started = time.perf_counter()
-        args = Namespace(modality="video", ctc_weight=0.1)
+        args = Namespace(modality="video", ctc_weight=ctc_weight)
         module = ModelModule(args)
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         module.model.load_state_dict(state_dict, strict=True)
         if self.encoder_device.type == "mps":
             _replace_mps_unsupported_pool(module.model)
-        self.model = module.model.to(self.encoder_device).eval()
-        if self.decoder_device != self.encoder_device:
-            self.model.decoder.to(self.decoder_device)
-            self.model.ctc.to(self.decoder_device)
+        self.model = module.model.eval()
+        self.model.frontend.to(self.encoder_device)
+        self.model.proj_encoder.to(self.encoder_device)
+        self.model.encoder.to(self.encoder_device)
+        self.model.decoder.to(self.decoder_device)
+        self.model.ctc.to(self.decoder_device)
         self.text_transform = module.text_transform
         self.token_list = module.token_list
         self.beam_search = get_beam_search_decoder(
             self.model,
             module.token_list,
             beam_size=beam_size,
-            ctc_weight=0.1,
+            ctc_weight=ctc_weight,
         )
+        self.word_certainty = word_certainty
+        self.cached_decoder = None
+        if decoder_cache and ctc_weight < 1:
+            from app.decoding import IncrementalDecoderScorer
+
+            self.cached_decoder = IncrementalDecoderScorer(self.model.decoder).eval()
+            self.beam_search.scorers["decoder"] = self.cached_decoder
+            self.beam_search.full_scorers["decoder"] = self.cached_decoder
+            self.beam_search.nn_dict["decoder"] = self.cached_decoder
         _synchronize(self.encoder_device)
         self.model_load_seconds = time.perf_counter() - started
 
     def transcribe(self, video: torch.Tensor, fps: float = 25.0) -> RecognitionResult:
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError("Frame rate must be positive and finite.")
         if video.ndim != 4 or video.shape[1:] != (1, 88, 88):
             raise ValueError(
                 f"Expected preprocessed video [T, 1, 88, 88], received {tuple(video.shape)}."
@@ -218,17 +238,42 @@ class AutoAVSRRecognizer:
             encoded = self.model.proj_encoder(encoded)
             encoded, _ = self.model.encoder(encoded, None)
             encoded = encoded.squeeze(0).to(self.decoder_device)
-            hypotheses = self.beam_search(encoded)
-            if not hypotheses:
-                raise RuntimeError("The decoder returned no transcription hypotheses.")
-            best_hypothesis = hypotheses[0]
-            word_certainties = self._estimate_word_certainties(
-                best_hypothesis.yseq, encoded
-            )
+            _synchronize(self.encoder_device)
+            encoder_finished = time.perf_counter()
+            try:
+                hypotheses = self.beam_search(encoded)
+                _synchronize(self.decoder_device)
+                decoder_finished = time.perf_counter()
+                if not hypotheses:
+                    raise RuntimeError(
+                        "The decoder returned no transcription hypotheses."
+                    )
+                best_hypothesis = hypotheses[0]
+                if not self.word_certainty:
+                    word_certainties = tuple()
+                elif self.cached_decoder is not None:
+                    ids, probabilities = self.cached_decoder.token_scores(
+                        best_hypothesis, self.model.eos
+                    )
+                    word_certainties = group_word_certainties(
+                        ids.cpu().tolist(),
+                        probabilities.cpu().tolist(),
+                        self.token_list,
+                    )
+                else:
+                    word_certainties = self._estimate_word_certainties(
+                        best_hypothesis.yseq, encoded
+                    )
+            finally:
+                if self.cached_decoder is not None:
+                    self.cached_decoder.clear()
         _synchronize(self.encoder_device)
-        inference_seconds = time.perf_counter() - started
+        inference_finished = time.perf_counter()
+        inference_seconds = inference_finished - started
         cpu_after = process.cpu_times()
-        cpu_seconds = (cpu_after.user + cpu_after.system) - (cpu_before.user + cpu_before.system)
+        cpu_seconds = (cpu_after.user + cpu_after.system) - (
+            cpu_before.user + cpu_before.system
+        )
 
         best = best_hypothesis.asdict()
         token_ids = torch.tensor([int(token) for token in best["yseq"][1:]])
@@ -255,6 +300,9 @@ class AutoAVSRRecognizer:
             word_certainties=word_certainties,
             average_process_cpu_percent=100 * cpu_seconds / inference_seconds,
             memory_rss_mb=process.memory_info().rss / (1024 * 1024),
+            encoder_seconds=encoder_finished - started,
+            decoder_seconds=decoder_finished - encoder_finished,
+            certainty_seconds=inference_finished - decoder_finished,
         )
 
     def _estimate_word_certainties(
@@ -273,9 +321,7 @@ class AutoAVSRRecognizer:
         targets = yseq[1:]
         length = decoder_input.size(1)
         target_mask = torch.tril(
-            torch.ones(
-                (length, length), device=self.decoder_device, dtype=torch.bool
-            )
+            torch.ones((length, length), device=self.decoder_device, dtype=torch.bool)
         ).unsqueeze(0)
         logits, _ = self.model.decoder(
             decoder_input, target_mask, encoded.unsqueeze(0), None

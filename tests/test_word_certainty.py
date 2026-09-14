@@ -39,3 +39,20 @@ def test_mps_spatial_pool_matches_the_original_model_pool() -> None:
     actual = MpsSpatialMaxPool()(video)
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("shape", [(1, 4, 7, 13, 15), (2, 4, 7, 14, 16)])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_pool_preserves_odd_shapes_and_noncontiguous_inputs(shape, noncontiguous):
+    video = torch.randn(shape)
+    if noncontiguous:
+        video = video.transpose(-1, -2)
+    expected = F.max_pool3d(video, (1, 3, 3), (1, 2, 2), (0, 1, 1))
+    assert torch.equal(MpsSpatialMaxPool()(video), expected)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is unavailable")
+def test_pool_matches_cpu_reference_on_mps():
+    video = torch.randn(1, 4, 7, 13, 15)
+    expected = F.max_pool3d(video, (1, 3, 3), (1, 2, 2), (0, 1, 1))
+    assert torch.equal(MpsSpatialMaxPool()(video.to("mps")).cpu(), expected)

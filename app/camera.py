@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import platform
 import subprocess
 import time
@@ -74,7 +75,9 @@ def resolve_camera(camera: str) -> CameraDevice:
     if value in builtin_aliases and platform.system() != "Darwin":
         return CameraDevice(0, "Default camera", "", "")
     if value in phone_aliases and platform.system() != "Darwin":
-        raise RuntimeError("The phone camera selector requires macOS Continuity Camera.")
+        raise RuntimeError(
+            "The phone camera selector requires macOS Continuity Camera."
+        )
 
     devices = discover_macos_cameras()
     if value in phone_aliases:
@@ -97,9 +100,7 @@ def resolve_camera(camera: str) -> CameraDevice:
         if device.is_builtin_mac_camera:
             return device
     names = ", ".join(device.name for device in devices) or "none"
-    raise RuntimeError(
-        "No built-in Mac camera was found. Available cameras: " + names
-    )
+    raise RuntimeError("No built-in Mac camera was found. Available cameras: " + names)
 
 
 def open_camera(
@@ -107,9 +108,17 @@ def open_camera(
     fps: float,
     warmup_seconds: float = 5.0,
 ) -> tuple[cv2.VideoCapture, np.ndarray]:
+    if (
+        not math.isfinite(fps)
+        or fps <= 0
+        or not math.isfinite(warmup_seconds)
+        or warmup_seconds <= 0
+    ):
+        raise ValueError("Camera fps and warmup duration must be positive and finite.")
     backend = cv2.CAP_AVFOUNDATION if platform.system() == "Darwin" else cv2.CAP_ANY
     camera = cv2.VideoCapture(device.index, backend)
     if not camera.isOpened():
+        camera.release()
         raise RuntimeError(
             f"Could not open {device.name} (camera {device.index}). Check Camera privacy permission."
         )

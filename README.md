@@ -86,9 +86,10 @@ video stream only
 ```
 
 On MPS, the expensive visual frontend and Conformer run on Metal. The legacy ESPnet
-CTC prefix scorer creates CPU index tensors, so decoding runs on CPU. PyTorch also
-falls back to CPU for one unsupported `max_pool3d` operation. This split fixes the
-device mismatch without modifying the checkpoint or third-party source.
+CTC prefix scorer creates CPU index tensors, so decoding runs on CPU. Spatial-only
+pooling uses an equivalent Metal-supported 2D operation. An inference adapter caches
+decoder self-attention and encoder-memory K/V without modifying checkpoint weights
+or third-party source; `--no-decoder-cache` selects the upstream reference decoder.
 
 ## Setup
 
@@ -119,15 +120,29 @@ Useful options:
 ```text
 --device auto|mps|cpu|cuda
 --beam-size N                 # default 10; larger is slower
+--ctc-weight FLOAT            # default 0.1; valid range 0..1
+--no-decoder-cache            # reference upstream decoding path
+--no-word-certainty           # omit word scoring (file CLI only)
 --checkpoint /path/model.pth
 --json
 ```
 
 Input should show one mostly front-facing English speaker. The model was trained around
-25 fps; other frame rates are resampled. The application reports missing files, empty
-videos, absent faces, invalid devices, and unexpected crop shapes directly.
+25 fps; other frame rates are resampled using PTS when available, including
+variable-frame-rate inputs. File clips are limited to 16 seconds and a 512 MiB raw
+RGB budget, checked during decoding before stacking. Longer/high-resolution clips
+must be explicitly split or downscaled; clips are never silently truncated. The
+application reports missing files, empty videos, unstable face tracks, invalid
+devices, and unexpected crop shapes directly.
 
 ## Webcam captions
+
+Camera delivery timestamps are resampled onto a 25 fps timeline rather than trusting
+the requested camera fps. Gaps over 0.5 seconds discard the active window and reset
+tracking. RGB capture buffers are downscaled to a maximum dimension of 640 pixels
+(the displayed image is unchanged); pending work has a separate 512 MiB budget.
+The UI reports dropped pending windows and queue delay. Caption latency is measured
+from the last detected lip movement, including endpoint and queue waiting.
 
 First grant camera access to the terminal or Codex app in **System Settings → Privacy &
 Security → Camera**, then run:
@@ -176,6 +191,9 @@ Hardware verification found `FaceTime HD Camera` and `iPhone Camera`; the named
 selectors avoid depending on their numeric indexes.
 
 ## Tests
+
+See [reliability and decoder-cache changes](docs/RELIABILITY_FIXES.md) for the
+implementation scope, new options, test coverage, and remaining validation work.
 
 ```bash
 uv run --no-sync pytest
