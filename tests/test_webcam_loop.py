@@ -8,6 +8,7 @@ import pytest
 
 from app import webcam
 from app.activity import LipMotionObservation
+from app.camera import CameraDevice
 from app.model import WordCertainty
 
 
@@ -72,4 +73,87 @@ def test_model_resources_close_when_camera_initialization_fails(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="no camera"):
         webcam.main.__wrapped__(["--camera", "0"])
+    pipeline.__exit__.assert_called_once()
+
+
+def test_c_key_switches_camera_and_resets_capture_state(monkeypatch):
+    now = [0.0]
+    key_presses = iter((ord("c"), ord("q")))
+    first_frame = np.zeros((24, 32, 3), np.uint8)
+    second_frame = np.ones((24, 32, 3), np.uint8)
+    first_camera = Mock()
+    second_camera = Mock()
+    motion = Mock()
+    motion.observe.return_value = LipMotionObservation(
+        True, 0.0, 0.0055, False, False
+    )
+    pipeline = MagicMock()
+    pipeline.__enter__.return_value = pipeline
+    built_in = CameraDevice(0, "FaceTime HD Camera", "Mac", "mac")
+    phone = CameraDevice(1, "iPhone Camera", "iPhone", "phone")
+    open_camera = Mock(
+        side_effect=((first_camera, first_frame), (second_camera, second_frame))
+    )
+
+    monkeypatch.setattr(webcam, "VisualSpeechPipeline", Mock(return_value=pipeline))
+    monkeypatch.setattr(webcam, "LipMotionDetector", Mock(return_value=motion))
+    monkeypatch.setattr(webcam, "resolve_camera", lambda _: built_in)
+    monkeypatch.setattr(webcam, "discover_macos_cameras", lambda: [built_in, phone])
+    monkeypatch.setattr(webcam, "open_camera", open_camera)
+    monkeypatch.setattr(webcam, "_create_resizable_window", lambda _: None)
+    monkeypatch.setattr(webcam, "_draw_text", lambda *_, **__: None)
+    monkeypatch.setattr(webcam.cv2, "imshow", lambda *_: None)
+    monkeypatch.setattr(webcam.cv2, "destroyAllWindows", Mock())
+    monkeypatch.setattr(webcam.cv2, "waitKey", lambda _: next(key_presses))
+    monkeypatch.setattr(webcam.time, "monotonic", lambda: now[0])
+
+    assert webcam.main.__wrapped__(["--camera", "0"]) == 0
+    assert [call.args[0] for call in open_camera.call_args_list] == [built_in, phone]
+    first_camera.release.assert_called_once()
+    second_camera.release.assert_called_once()
+    motion.reset.assert_called_once()
+    pipeline.__exit__.assert_called_once()
+
+
+def test_failed_camera_switch_restores_previous_camera(monkeypatch):
+    key_presses = iter((ord("c"), ord("q")))
+    frame = np.zeros((24, 32, 3), np.uint8)
+    first_camera = Mock()
+    restored_camera = Mock()
+    motion = Mock()
+    motion.observe.return_value = LipMotionObservation(
+        True, 0.0, 0.0055, False, False
+    )
+    pipeline = MagicMock()
+    pipeline.__enter__.return_value = pipeline
+    built_in = CameraDevice(0, "FaceTime HD Camera", "Mac", "mac")
+    phone = CameraDevice(1, "iPhone Camera", "iPhone", "phone")
+    open_camera = Mock(
+        side_effect=(
+            (first_camera, frame),
+            RuntimeError("phone unavailable"),
+            (restored_camera, frame),
+        )
+    )
+
+    monkeypatch.setattr(webcam, "VisualSpeechPipeline", Mock(return_value=pipeline))
+    monkeypatch.setattr(webcam, "LipMotionDetector", Mock(return_value=motion))
+    monkeypatch.setattr(webcam, "resolve_camera", lambda _: built_in)
+    monkeypatch.setattr(webcam, "discover_macos_cameras", lambda: [built_in, phone])
+    monkeypatch.setattr(webcam, "open_camera", open_camera)
+    monkeypatch.setattr(webcam, "_create_resizable_window", lambda _: None)
+    monkeypatch.setattr(webcam, "_draw_text", lambda *_, **__: None)
+    monkeypatch.setattr(webcam.cv2, "imshow", lambda *_: None)
+    monkeypatch.setattr(webcam.cv2, "destroyAllWindows", Mock())
+    monkeypatch.setattr(webcam.cv2, "waitKey", lambda _: next(key_presses))
+
+    assert webcam.main.__wrapped__(["--camera", "0"]) == 0
+    assert [call.args[0] for call in open_camera.call_args_list] == [
+        built_in,
+        phone,
+        built_in,
+    ]
+    first_camera.release.assert_called_once()
+    restored_camera.release.assert_called_once()
+    motion.reset.assert_called_once()
     pipeline.__exit__.assert_called_once()

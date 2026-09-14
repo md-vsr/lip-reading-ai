@@ -56,6 +56,37 @@ def discover_macos_cameras() -> list[CameraDevice]:
     ]
 
 
+def next_camera_device(
+    current: CameraDevice, devices: list[CameraDevice]
+) -> CameraDevice:
+    """Return the next distinct camera in stable device-index order."""
+    available = sorted(
+        {device.index: device for device in devices}.values(),
+        key=lambda device: device.index,
+    )
+    if not available:
+        raise RuntimeError("No cameras are currently available.")
+
+    current_position = next(
+        (
+            position
+            for position, device in enumerate(available)
+            if (
+                current.unique_id
+                and device.unique_id
+                and device.unique_id == current.unique_id
+            )
+            or device.index == current.index
+        ),
+        None,
+    )
+    if current_position is None:
+        return available[0]
+    if len(available) == 1:
+        raise RuntimeError("No other camera is currently available.")
+    return available[(current_position + 1) % len(available)]
+
+
 def resolve_camera(camera: str) -> CameraDevice:
     value = camera.strip().lower()
     builtin_aliases = {"built-in", "builtin", "mac"}

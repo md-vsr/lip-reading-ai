@@ -17,7 +17,12 @@ import cv2
 import numpy as np
 
 from app.activity import LipMotionDetector, SpeechWindowCollector
-from app.camera import discover_macos_cameras, open_camera, resolve_camera
+from app.camera import (
+    discover_macos_cameras,
+    next_camera_device,
+    open_camera,
+    resolve_camera,
+)
 from app.config import DEFAULT_CHECKPOINT, TARGET_FPS
 from app.model import WordCertainty
 from app.native_logging import with_filtered_native_diagnostics
@@ -458,7 +463,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         camera, first_frame = open_camera(device, TARGET_FPS)
-        resources.callback(camera.release)
+        active_camera = [camera]
+        resources.callback(lambda: active_camera[0].release())
         motion_detector = LipMotionDetector(
             min_motion_score=args.mouth_motion_threshold
         )
@@ -498,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
     face_visible = False
     lips_moving = False
     latency: float | None = None
+    camera_notice: str | None = None
+    camera_notice_until = 0.0
 
     try:
         while True:
@@ -616,7 +624,9 @@ def main(argv: list[str] | None = None) -> int:
                 future = executor.submit(pipeline.transcribe_frames, segment.frames)
                 del segment
 
-            if speech_collector.capturing and future is not None:
+            if camera_notice is not None and time.monotonic() < camera_notice_until:
+                status = camera_notice
+            elif speech_collector.capturing and future is not None:
                 status = "CAPTURING / PROCESSING"
             elif speech_collector.capturing:
                 status = "CAPTURING VISIBLE SPEECH"
@@ -649,15 +659,24 @@ def main(argv: list[str] | None = None) -> int:
                 0.55,
                 (80, 220, 100) if lips_moving else face_color,
             )
+            camera_details = f"CAMERA: {device.name}"
             if latency is not None:
-                _draw_text(
-                    display,
-                    f"Last latency: {latency:.1f}s",
-                    (max(18, width - 270), 62),
-                    0.5,
-                    (220, 220, 220),
-                    1,
-                )
+                camera_details += f" | latency {latency:.1f}s"
+            detail_width = min(410, width - 36)
+            detail_scale = _fit_text_scale(
+                camera_details,
+                detail_width,
+                preferred=0.48,
+                minimum=0.3,
+            )
+            _draw_text(
+                display,
+                camera_details,
+                (max(18, width - detail_width - 18), 62),
+                detail_scale,
+                (220, 220, 220),
+                1,
+            )
 
             row_area_top = panel_top + 8
             row_area_bottom = height - 34
@@ -710,7 +729,10 @@ def main(argv: list[str] | None = None) -> int:
                     )
             _draw_text(
                 display,
-                f"Q: quit | queue {queue_delay:.1f}s | dropped {ready_segments.dropped}",
+                (
+                    f"C: switch camera | Q: quit | queue {queue_delay:.1f}s | "
+                    f"dropped {ready_segments.dropped}"
+                ),
                 (22, height - 12),
                 0.42,
                 (180, 180, 180),
@@ -726,8 +748,55 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             cv2.imshow(WINDOW_TITLE, display)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
                 break
+            if key in (ord("c"), ord("C")):
+                try:
+                    target_device = next_camera_device(
+                        device, discover_macos_cameras()
+                    )
+                except Exception as exc:
+                    camera_notice = str(exc).upper()
+                    camera_notice_until = time.monotonic() + 3.0
+                    continue
+
+                previous_device = device
+                camera.release()
+                try:
+                    camera, first_frame = open_camera(target_device, TARGET_FPS)
+                    device = target_device
+                    camera_notice = f"CAMERA CHANGED TO {device.name}".upper()
+                    print(f"Selected camera {device.index}: {device.name}")
+                except RuntimeError as switch_error:
+                    try:
+                        camera, first_frame = open_camera(
+                            previous_device, TARGET_FPS
+                        )
+                    except RuntimeError as restore_error:
+                        raise RuntimeError(
+                            f"Could not open {target_device.name}, and could not "
+                            f"restore {previous_device.name}: {restore_error}"
+                        ) from switch_error
+                    camera_notice = (
+                        f"COULD NOT OPEN {target_device.name}; USING "
+                        f"{previous_device.name}"
+                    ).upper()
+                    print(f"Camera switch failed: {switch_error}")
+                active_camera[0] = camera
+                camera_notice_until = time.monotonic() + 3.0
+
+                if active_entry_id is not None:
+                    caption_history.discard(active_entry_id)
+                    active_entry_id = None
+                speech_collector = new_collector()
+                frame_clock = FrameClock(TARGET_FPS)
+                motion_detector.reset()
+                last_observed_frame = None
+                last_observation = None
+                last_motion_at = time.monotonic()
+                face_visible = False
+                lips_moving = False
     finally:
         resources.close()
     return 0

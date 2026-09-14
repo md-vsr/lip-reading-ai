@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from app.camera import CameraDevice, resolve_camera
+from app.camera import CameraDevice, next_camera_device, resolve_camera
 
 
 CAMERA_JSON = """{
@@ -66,3 +66,18 @@ def test_builtin_camera_classification() -> None:
     ).is_builtin_mac_camera
     assert not CameraDevice(1, "iPhone Camera", "iPhone14,3", "y").is_builtin_mac_camera
     assert CameraDevice(1, "iPhone Camera", "iPhone14,3", "y").is_phone_camera
+
+
+def test_next_camera_cycles_in_stable_index_order() -> None:
+    built_in = CameraDevice(0, "FaceTime HD Camera", "Mac", "mac")
+    phone = CameraDevice(1, "iPhone Camera", "iPhone", "phone")
+
+    assert next_camera_device(built_in, [phone, built_in]) == phone
+    assert next_camera_device(phone, [phone, built_in]) == built_in
+
+
+def test_next_camera_requires_another_available_device() -> None:
+    built_in = CameraDevice(0, "FaceTime HD Camera", "Mac", "mac")
+
+    with pytest.raises(RuntimeError, match="No other camera"):
+        next_camera_device(built_in, [built_in])
